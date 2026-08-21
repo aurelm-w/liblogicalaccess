@@ -196,33 +196,40 @@ ByteVector DESFireEV2Crypto::desfireEncrypt(const ByteVector &data,
     if (d_auth_method != CryptoMethod::CM_EV2)
         return DESFireCrypto::desfireEncrypt(data, param, calccrc);
 
-    const auto IV = getIVEncrypt(true);
-
-    // Encrypt
-    const auto isokey = std::make_shared<openssl::AESSymmetricKey>(
-        openssl::AESSymmetricKey::createFromData(d_sessionKey));
-    const auto iv = std::make_shared<openssl::AESInitializationVector>(
-        openssl::AESInitializationVector::createFromData(IV));
-
     ByteVector encdata;
-    ByteVector dataCalc = data;
 
-    if (dataCalc.size() % d_cipher->getBlockSize() != 0)
+    // An empty command payload remains empty
+    // No padding and no AES encryption are performed
+    if (!data.empty())
     {
+        const auto IV = getIVEncrypt(true);
+
+        const auto isokey = std::make_shared<openssl::AESSymmetricKey>(
+            openssl::AESSymmetricKey::createFromData(d_sessionKey));
+        const auto iv = std::make_shared<openssl::AESInitializationVector>(
+            openssl::AESInitializationVector::createFromData(IV));
+
+        ByteVector dataCalc = data;
+
+        const std::size_t blockSize = d_cipher->getBlockSize();
+
         dataCalc.push_back(0x80);
-        if (dataCalc.size() % d_cipher->getBlockSize() != 0)
-            dataCalc.resize(
-                static_cast<unsigned char>(data.size() / d_cipher->getBlockSize() + 1) *
-                d_cipher->getBlockSize());
+
+        const std::size_t remainder = dataCalc.size() % blockSize;
+
+        if (remainder != 0)
+            dataCalc.resize(dataCalc.size() + (blockSize - remainder), 0x00);
+
+        d_cipher->cipher(dataCalc, encdata, *isokey, *iv, false);
     }
 
-    d_cipher->cipher(dataCalc, encdata, *isokey, *iv, false);
+    ByteVector macData = encdata;
 
-    ByteVector result = encdata;
     if (param.size() > 1)
-        encdata.insert(encdata.begin(), param.begin() + 1, param.end());
-    auto m = generateMAC(param[0], encdata);
-    result.insert(result.end(), m.begin(), m.end());
+        macData.insert(macData.begin(), param.begin() + 1, param.end());
+    const auto mac = generateMAC(param[0], macData);
+    ByteVector result = encdata;
+    result.insert(result.end(), mac.begin(), mac.end());
 
     return result;
 }

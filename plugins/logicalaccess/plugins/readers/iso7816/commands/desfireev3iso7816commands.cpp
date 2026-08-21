@@ -8,6 +8,11 @@ DESFireEV3ISO7816Commands::DESFireEV3ISO7816Commands()
 {
 }
 
+DESFireEV3ISO7816Commands::DESFireEV3ISO7816Commands(const std::string &cmd_type)
+    : DESFireEV2ISO7816Commands(cmd_type)
+{
+}
+
 std::shared_ptr<Chip> DESFireEV3ISO7816Commands::getChip() const
 {
     return DESFireEV2ISO7816Commands::getChip();

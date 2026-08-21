@@ -146,7 +146,7 @@ class LLA_READERS_ISO7816_API DESFireEV2ISO7816Commands
 
     bool performECCOriginalityCheck() override;
 
-  private:
+  protected:
     /**
      * \brief Transmit a command.
      * \param cmd The command code.
@@ -169,6 +169,8 @@ class LLA_READERS_ISO7816_API DESFireEV2ISO7816Commands
     ISO7816Response transmit_nomacv(unsigned char cmd,
                                     const ByteVector &buf = ByteVector(),
                                unsigned char lc = 0, bool forceLc = false) override;
+
+  private:
 
     /**
      * \brief Generic method to create read file cmd.

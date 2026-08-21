@@ -1,58 +1,66 @@
 cmake_minimum_required(VERSION 3.10)
-project(basic CXX)
+project(basic
+    LANGUAGES CXX
+)
 
+# Common libraries
+set(LIBLOGICALACCESS_COMMON_LIBRARIES
+    logicalaccess
+    iso7816cards
+    desfirecards
+    iso7816readers
+    pcscreaders
+)
+
+# basic
 add_executable(basic
-        basic.cpp)
+    basic.cpp
+)
 
 target_link_libraries(basic
-        iso7816cards
-        desfirecards
-        logicalaccess
-        iso7816cards
-        iso7816readers
-        pcscreaders
-        )
+    PRIVATE
+        ${LIBLOGICALACCESS_COMMON_LIBRARIES}
+)
 
-install(TARGETS basic
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib${LIB_SUFFIX}
-        ARCHIVE DESTINATION lib${LIB_SUFFIX})
-
-project(basic_pki CXX)
-
+# basic_pki
 add_executable(basic_pki
-        basic_pki.cpp)
+    basic_pki.cpp
+)
 
 target_link_libraries(basic_pki
-        iso7816cards
-        desfirecards
-        logicalaccess
-        iso7816cards
-        iso7816readers
-        pcscreaders
-        )
+    PRIVATE
+        ${LIBLOGICALACCESS_COMMON_LIBRARIES}
+)
 
-install(TARGETS basic_pki
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib${LIB_SUFFIX}
-        ARCHIVE DESTINATION lib${LIB_SUFFIX})
-
-project(basic_desfire_sam CXX)
-
+# basic_desfire_sam
 add_executable(basic_desfire_sam
-        basic_desfire_sam.cpp)
+    basic_desfire_sam.cpp
+)
 
 target_link_libraries(basic_desfire_sam
-        iso7816cards
-        desfirecards
-        logicalaccess
-        iso7816cards
-        iso7816readers
+    PRIVATE
+        ${LIBLOGICALACCESS_COMMON_LIBRARIES}
         samavcards
-        pcscreaders
-        )
+)
 
-install(TARGETS basic_desfire_sam
-        RUNTIME DESTINATION bin
-        LIBRARY DESTINATION lib${LIB_SUFFIX}
-        ARCHIVE DESTINATION lib${LIB_SUFFIX})
+# basic_duox
+add_executable(basic_duox
+    basic_duox.cpp
+)
+
+target_link_libraries(basic_duox
+    PRIVATE
+        ${LIBLOGICALACCESS_COMMON_LIBRARIES}
+)
+
+# Installation
+install(
+    TARGETS
+        basic
+        basic_pki
+        basic_desfire_sam
+        basic_duox
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib${LIB_SUFFIX}
+    ARCHIVE DESTINATION lib${LIB_SUFFIX}
+)

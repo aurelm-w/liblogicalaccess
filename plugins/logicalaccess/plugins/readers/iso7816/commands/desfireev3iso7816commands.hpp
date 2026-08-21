@@ -17,6 +17,8 @@ class LLA_READERS_ISO7816_API DESFireEV3ISO7816Commands
   public:
     DESFireEV3ISO7816Commands();
 
+    explicit DESFireEV3ISO7816Commands(const std::string &cmd_type);
+
     std::shared_ptr<Chip> getChip() const override;
 
     std::shared_ptr<ReaderCardAdapter> getReaderCardAdapter() const override;
