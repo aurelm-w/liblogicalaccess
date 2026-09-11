@@ -121,7 +121,7 @@ enum class ReaderCertificateMode
 };
 
 // Select exactly one diagnostic mode per execution
-constexpr ReaderCertificateMode TEST_READER_CERTIFICATE_MODE = ReaderCertificateMode::WithCertA::WithoutCertA;
+constexpr ReaderCertificateMode TEST_READER_CERTIFICATE_MODE = ReaderCertificateMode::WithCertA;
 
 // ==============================================
 // Generic utilities
