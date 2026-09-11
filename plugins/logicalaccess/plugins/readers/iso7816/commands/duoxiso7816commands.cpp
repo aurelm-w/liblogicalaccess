@@ -6,17 +6,111 @@
 #include <logicalaccess/plugins/crypto/lla_random.hpp>
 #include <logicalaccess/plugins/crypto/aes_helper.hpp>
 
+// Remove later
+#include <iomanip>
+#include <sstream>
+#include <logicalaccess/plugins/crypto/x509V3Certificate.hpp>
+
 namespace logicalaccess
 {
 
 namespace
 {
 
-    
+// -------------------------------------------------------------------------
+// Remove later
+// -------------------------------------------------------------------------
+void printInfo(const std::string &message)
+{
+    std::cout << "[INFO] " << message << '\n';
+}
+
+static std::string hexDump(const ByteVector &data)
+{
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < data.size(); ++i)
+    {
+        if (i != 0)
+            oss << ' ';
+        oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << static_cast<unsigned int>(data[i]);
+    }
+    return oss.str();
+}
+
+void verifySignatureWithCertificate(const ByteVector &certificateDER, const ByteVector &message,
+                                    const ECDSASignature &signature)
+{
+    logicalaccess::X509V3Certificate certificate(certificateDER);
+
+    EVP_PKEY *certificateKey = certificate.getEVPPublicKey();
+
+    if (certificateKey == nullptr)
+        throw std::runtime_error("Cert.A does not contain a public key.");
+
+    if (EVP_PKEY_base_id(certificateKey) != EVP_PKEY_EC)
+    {
+        EVP_PKEY_free(certificateKey);
+        throw std::runtime_error("Cert.A public key is not an EC key.");
+    }
+
+    // Convert DUOX r/s representation back to the DER signature representation expected by OpenSSL
+    const ByteVector derSignature = encodeECDSASignatureDER(signature);
+
+    if (derSignature.empty())
+    {
+        EVP_PKEY_free(certificateKey);
+        throw std::runtime_error("Unable to encode DUOX ECDSA signature.");
+    }
+
+    // Verify ECDSA-SHA256(message, Cert.A public key)
+    // signECDSA() hashes the message internally so verification must use SHA-256 as well
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+
+    if (ctx == nullptr)
+    {
+        EVP_PKEY_free(certificateKey);
+        throw std::runtime_error("Unable to allocate EVP_MD_CTX.");
+    }
+
+    if (EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, certificateKey) != 1)
+    {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(certificateKey);
+        throw std::runtime_error("EVP_DigestVerifyInit failed for Cert.A public key.");
+    }
+
+    if (EVP_DigestVerifyUpdate(ctx, message.data(), message.size()) != 1)
+    {
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(certificateKey);
+        throw std::runtime_error("EVP_DigestVerifyUpdate failed.");
+    }
+
+    const int result = EVP_DigestVerifyFinal(ctx, derSignature.data(), derSignature.size());
+
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(certificateKey);
+
+    if (result != 1)
+        throw std::runtime_error("DUOX Sig.A verification failed using the public key contained in Cert.A.");
+    std::cout << "[INFO] DUOX Sig.A verified with Cert.A public key." << std::endl;
+}
+
+static void debugBytes(const std::string &label, const ByteVector &data)
+{
+    printInfo(label + " [" + std::to_string(data.size()) + " bytes]: " + hexDump(data));
+}
+
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+
 constexpr std::uint8_t DUOX_INS_GET_KEY_SETTINGS   = 0x45;
 constexpr std::uint8_t DUOX_INS_MANAGE_KEY_PAIR    = 0x46;
 constexpr std::uint8_t DUOX_INS_EXPORT_KEY         = 0x47;
 constexpr std::uint8_t DUOX_INS_MANAGE_CA_ROOT_KEY = 0x48;
+constexpr std::uint8_t DUOX_INS_CHANGE_KEY         = 0xC4;
+constexpr std::uint8_t DUOX_INS_CHANGE_KEY_EV2     = 0xC6;
 
 constexpr std::uint8_t DFEV2_INS_AUTHENTICATE_EV2_NON_FIRST = 0x77;
 
@@ -86,6 +180,40 @@ std::string byteToHex(std::uint8_t value)
     return stream.str();
 }
 
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+struct DUOXExpectedStatus
+{
+    std::uint8_t sw1;
+    std::uint8_t sw2;
+};
+
+constexpr DUOXExpectedStatus DUOX_SUCCESS = {0x91, 0x00};
+
+// For now any non-zero status on 0x9100 is considered failure
+void checkSuccess(const ISO7816Response &response, DUOXExpectedStatus expected, const char *caller)
+{
+    EXCEPTION_ASSERT_WITH_LOG(response.getSW1() == expected.sw1 && response.getSW2() == expected.sw2,
+        LibLogicalAccessException,
+        std::string(caller) + " failed with status word " +
+            byteToHex(response.getSW1()) + " " + byteToHex(response.getSW2()) +
+            ", expected " + byteToHex(expected.sw1) + " " + byteToHex(expected.sw2) + ".");
+}
+
+// Might be better than checkSuccess if only want to check SW2 like DUOX commands do. But at transmit,
+// we get transmission response (SW1=0x91 or another code in very rare cases of error) and DUOX response (SW1)
+void checkSW2(const ISO7816Response &response, std::uint8_t expectedSW2, const char *caller)
+{
+    EXCEPTION_ASSERT_WITH_LOG(response.getSW2() == expectedSW2,
+        LibLogicalAccessException,
+        std::string(caller) + " failed with SW2 " + byteToHex(response.getSW2()) + ", expected " +
+        byteToHex(expectedSW2) + ".");
+}
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+
 } // namespace
 
 // DUOXCommands and DESFireEV3ISO7816Commands both derive from DESFireEV3Commands
@@ -144,7 +272,7 @@ ISO7816Response DUOXISO7816Commands::transmitDUOX(std::uint8_t cmd, const ByteVe
 // DUOX
 // ------------------
 ByteVector DUOXISO7816Commands::manageKeyPair(std::uint8_t keyNo, DUOXManageKeyPairOption option,
-                                              DUOXCurveID curveId, std::uint16_t keyPolicy,
+                                              CurveID curveId, std::uint16_t keyPolicy,
                                               std::uint8_t writeAccess, std::uint32_t kucLimit,
                                               const ByteVector &privateKey, DUOXCommunicationMode commMode)
 {
@@ -191,8 +319,8 @@ ByteVector DUOXISO7816Commands::manageKeyPair(std::uint8_t keyNo, DUOXManageKeyP
 
     switch (curveId)
     {
-    case DUOXCurveID::NIST_P256:
-    case DUOXCurveID::BRAINPOOL_P256R1: break;
+    case CurveID::NIST_P256:
+    case CurveID::BRAINPOOL_P256R1: break;
     default:
         THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
             "Unsupported DUOX CurveID " + byteToHex(static_cast<std::uint8_t>(curveId)) + ".");
@@ -245,10 +373,7 @@ ByteVector DUOXISO7816Commands::manageKeyPair(std::uint8_t keyNo, DUOXManageKeyP
               << "\n"
               << "=================================================\n";
 
-    //TODO For now any non-zero status is considered failure
-    if (response.getSW2() != 0x00)
-        THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
-            "DUOX ManageKeyPair failed with status word " + byteToHex(response.getSW2()) + ".");
+    checkSuccess(response, DUOX_SUCCESS, __func__);
 
     switch (option)
     {
@@ -274,7 +399,7 @@ ByteVector DUOXISO7816Commands::manageKeyPair(std::uint8_t keyNo, DUOXManageKeyP
 }
 
 void DUOXISO7816Commands::manageCARootKey(
-    std::uint8_t keyNo, DUOXCurveID curveId, std::uint16_t accessRights,
+    std::uint8_t keyNo, CurveID curveId, std::uint16_t accessRights,
     std::uint8_t writeAccess, std::uint8_t readAccess, std::uint8_t crlFile,
     std::uint32_t crlFileAid, const ByteVector &publicKey, const ByteVector &issuer,
     DUOXCommunicationMode commMode)
@@ -305,8 +430,8 @@ void DUOXISO7816Commands::manageCARootKey(
     // CurveID currently supports only the two curves defined by DUOX.
     switch (curveId)
     {
-    case DUOXCurveID::NIST_P256:
-    case DUOXCurveID::BRAINPOOL_P256R1: break;
+    case CurveID::NIST_P256:
+    case CurveID::BRAINPOOL_P256R1: break;
 
     default:
         THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
@@ -452,12 +577,7 @@ void DUOXISO7816Commands::manageCARootKey(
               << "\n"
               << "=================================================\n";
 
-    // For now any non-zero status is considered failure
-    if (response.getSW2() != 0x00)
-    {
-        THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
-            "DUOX ManageCARootKey failed with status word " + byteToHex(response.getSW2()) + ".");
-    }
+    checkSuccess(response, DUOX_SUCCESS, __func__);
 
     EXCEPTION_ASSERT_WITH_LOG(response.getData().empty(),
         LibLogicalAccessException, "DUOX ManageCARootKey returned unexpected response data.");
@@ -505,10 +625,7 @@ ByteVector DUOXISO7816Commands::exportKey(std::uint8_t keyNo, DUOXCommunicationM
 
     const auto response = transmitDUOX(DUOX_INS_EXPORT_KEY, params, {}, commMode);
 
-    // For now any non-zero status is considered failure
-    if (response.getSW2() != 0x00)
-        THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
-            "DUOX ExportKey failed with status word " + byteToHex(response.getSW2()) + ".");
+    checkSuccess(response, DUOX_SUCCESS, __func__);
 
     const auto &publicKey = response.getData();
     std::cout << "\n========== DUOX ExportKey RESPONSE ==========\n"
@@ -559,6 +676,18 @@ void DUOXISO7816Commands::authenticateEV2NonFirst(uint8_t keyno, std::shared_ptr
     const ByteVector command = {keyno};
 
     auto response = transmit_plain(DFEV2_INS_AUTHENTICATE_EV2_NON_FIRST, command);
+    
+    // TODO Will lose "AuthenticateEV2NonFirst Part 1 failed : expected Additional Frame." if doing checkSuccess
+    // constexpr DUOXExpectedStatus EXPECTED_ADDITIONAL_FRAME = {0x91, DF_INS_ADDITIONAL_FRAME};
+    // checkSuccess(response, EXPECTED_ADDITIONAL_FRAME, __func__);
+    // TODO later :
+    /* constexpr std::uint8_t EXPECTED_SW1 = 0x91;
+    constexpr std::uint8_t EXPECTED_SW2 = DF_INS_ADDITIONAL_FRAME;
+
+    EXCEPTION_ASSERT_WITH_LOG(
+        response.getSW1() == EXPECTED_SW1 && response.getSW2() == EXPECTED_SW2,
+        LibLogicalAccessException,
+        "AuthenticateEV2NonFirst Part 1 failed: expected 9100/91AF response.");*/
 
     EXCEPTION_ASSERT_WITH_LOG(response.getSW2() == DF_INS_ADDITIONAL_FRAME,
         LibLogicalAccessException, "AuthenticateEV2NonFirst Part 1 failed : expected Additional Frame.");
@@ -638,24 +767,16 @@ std::uint32_t DUOXISO7816Commands::freeMem()
     const auto response = transmit(DFEV1_INS_FREE_MEM);
     const auto &data    = response.getData();
 
-    if (data.size() != FREE_MEM_RESPONSE_SIZE)
-        THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException, "DESFire FreeMem returned an invalid response length.");
+    EXCEPTION_ASSERT_WITH_LOG(data.size() == FREE_MEM_RESPONSE_SIZE,
+        LibLogicalAccessException, "DESFire FreeMem returned an invalid response length.");
 
     return static_cast<std::uint32_t>(data[0]) |
            (static_cast<std::uint32_t>(data[1]) << 8U) |
            (static_cast<std::uint32_t>(data[2]) << 16U);
 }
 
-DUOXKeySettings DUOXISO7816Commands::getKeySettings()
+DUOXKeySettings DUOXISO7816Commands::getKeySettings(DUOXKeySettingsOption option)
 {
-    return getKeySettings(0x00);
-}
-
-DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
-{
-    constexpr std::uint8_t OPTION_NONE            = 0x00;
-    constexpr std::uint8_t OPTION_ECC_PRIVATE_KEY = 0x01;
-    constexpr std::uint8_t OPTION_CA_ROOT_KEY     = 0x02;
     constexpr std::size_t ECC_METADATA_ENTRY_SIZE = 13;
     constexpr std::size_t CA_ROOT_METADATA_ENTRY_SIZE = 10;
     constexpr std::uint8_t MAX_METADATA_ENTRIES = 0x05;
@@ -665,6 +786,13 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
     constexpr std::uint8_t KEY_TYPE_RESERVED = 0x40;
     constexpr std::uint8_t KEY_TYPE_AES128 = 0x80;
     constexpr std::uint8_t KEY_TYPE_AES256 = 0xC0;
+
+    EXCEPTION_ASSERT_WITH_LOG(
+        option == DUOXKeySettingsOption::KeySettings ||
+        option == DUOXKeySettingsOption::ECCPrivateKeyMetadata ||
+        option == DUOXKeySettingsOption::CARootKeyMetadata,
+        LibLogicalAccessException, "Invalid DUOX GetKeySettings option : " + byteToHex(static_cast<std::uint8_t>(option)) +
+            ". Supported values are 0x00, 0x01 and 0x02.");
 
     const auto chip = getDESFireChip();
 
@@ -678,36 +806,29 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
 
     const bool piccLevel = crypto->d_currentAid == DUOX_PICC_LEVEL_AID;
 
-    EXCEPTION_ASSERT_WITH_LOG(
-        option == OPTION_NONE || option == OPTION_ECC_PRIVATE_KEY || option == OPTION_CA_ROOT_KEY,
-        LibLogicalAccessException,
-        "Invalid DUOX GetKeySettings option : " + byteToHex(option) + ". Supported values are 0x00, 0x01 and 0x02.");
-
     ByteVector params;
-    if (option != OPTION_NONE)
+    if (option != DUOXKeySettingsOption::KeySettings)
     {
         params.reserve(1);
-        params.push_back(option);
+        params.push_back(static_cast<std::uint8_t>(option));
     }
 
-    const ByteVector command;
+    const auto response = transmitDUOX(DUOX_INS_GET_KEY_SETTINGS, params, {}, DUOXCommunicationMode::MAC);
 
-    const auto response = transmitDUOX(DUOX_INS_GET_KEY_SETTINGS, params, command, DUOXCommunicationMode::MAC);
-
-    // For now any non-zero status is considered failure
-    if (response.getSW2() != 0x00)
-        THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
-            "DUOX GetKeySettings failed with status word " + byteToHex(response.getSW2()) + ".");
+    checkSuccess(response, DUOX_SUCCESS, __func__);
 
     const ByteVector &data = response.getData();
 
     DUOXKeySettings result;
     result.piccLevel = piccLevel;
 
+    // TODO refactor later : add a switch per option. Just set code in sub-functions, don't optimize any further
+    // Each "if" section should be contained in a proper sub function
+
     // ECC private key metadata
-    if (option == OPTION_ECC_PRIVATE_KEY)
+    if (option == DUOXKeySettingsOption::ECCPrivateKeyMetadata)
     {
-        result.responseType = DUOXGetKeySettingsResponseType::ECCPrivateKeyMetadata;
+        result.responseType = DUOXKeySettingsOption::ECCPrivateKeyMetadata;
 
         EXCEPTION_ASSERT_WITH_LOG(!data.empty(),
             LibLogicalAccessException, "DUOX GetKeySettings ECC private key metadata response is empty.");
@@ -734,11 +855,11 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
             entry.keyNo = data[offset++];
             const std::uint8_t rawCurveId = data[offset++];
 
-            switch (static_cast<DUOXCurveID>(rawCurveId))
+            switch (static_cast<CurveID>(rawCurveId))
             {
-            case DUOXCurveID::NIST_P256:
-            case DUOXCurveID::BRAINPOOL_P256R1:
-                entry.curveId = static_cast<DUOXCurveID>(rawCurveId);
+            case CurveID::NIST_P256:
+            case CurveID::BRAINPOOL_P256R1:
+                entry.curveId = static_cast<CurveID>(rawCurveId);
                 break;
             default:
                 THROW_EXCEPTION_WITH_LOG(LibLogicalAccessException,
@@ -782,9 +903,9 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
     }
 
     // CA Root Key metadata
-    if (option == OPTION_CA_ROOT_KEY)
+    if (option == DUOXKeySettingsOption::CARootKeyMetadata)
     {
-        result.responseType = DUOXGetKeySettingsResponseType::CARootKeyMetadata;
+        result.responseType = DUOXKeySettingsOption::CARootKeyMetadata;
 
         EXCEPTION_ASSERT_WITH_LOG(!data.empty(),
             LibLogicalAccessException, "DUOX GetKeySettings CA Root Key metadata response is empty.");
@@ -812,11 +933,11 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
 
             const std::uint8_t rawCurveId = data[offset++];
 
-            switch (static_cast<DUOXCurveID>(rawCurveId))
+            switch (static_cast<CurveID>(rawCurveId))
             {
-            case DUOXCurveID::NIST_P256:
-            case DUOXCurveID::BRAINPOOL_P256R1:
-                entry.curveId = static_cast<DUOXCurveID>(rawCurveId);
+            case CurveID::NIST_P256:
+            case CurveID::BRAINPOOL_P256R1:
+                entry.curveId = static_cast<CurveID>(rawCurveId);
                 break;
 
             default:
@@ -879,7 +1000,7 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
     }
 
     //Base KeySettings response
-    result.responseType = DUOXGetKeySettingsResponseType::KeySettings;
+    result.responseType = DUOXKeySettingsOption::KeySettings;
 
     EXCEPTION_ASSERT_WITH_LOG(data.size() >= 2, LibLogicalAccessException,
         "DUOX GetKeySettings returned an incomplete key-settings response : at least 2 bytes are required.");
@@ -954,14 +1075,768 @@ DUOXKeySettings DUOXISO7816Commands::getKeySettings(std::uint8_t option)
     return result;
 }
 
-// ------------------
+void DUOXISO7816Commands::changeKey(std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey)
+{
+    changeKeyEV2Internal(0x00, keyNo, std::move(newKey), DUOXChangeKeyCommand::ChangeKey);
+}
+
+void DUOXISO7816Commands::changeKeyEV2(std::uint8_t keySetNo, std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey)
+{
+    changeKeyEV2Internal(keySetNo, keyNo, std::move(newKey), DUOXChangeKeyCommand::ChangeKeyEV2);
+}
+
+void DUOXISO7816Commands::changeKeyEV2Internal(std::uint8_t keySetNo, std::uint8_t keyNo,
+    std::shared_ptr<DESFireKey> newKey, DUOXChangeKeyCommand commandType)
+{
+    const bool isChangeKey = commandType == DUOXChangeKeyCommand::ChangeKey;
+
+    const char *functionName = isChangeKey ? "DUOX ChangeKey" : "DUOX ChangeKeyEV2";
+
+    auto chip = getDESFireChip();
+
+    EXCEPTION_ASSERT_WITH_LOG(chip != nullptr,
+        LibLogicalAccessException, std::string(functionName) + " requires an initialized DESFire chip.");
+
+    auto crypto = std::dynamic_pointer_cast<DESFireEV2Crypto>(chip->getCrypto());
+
+    EXCEPTION_ASSERT_WITH_LOG(crypto != nullptr,
+        LibLogicalAccessException, std::string(functionName) + " requires DESFireEV2 crypto.");
+
+    EXCEPTION_ASSERT_WITH_LOG(newKey != nullptr,
+        LibLogicalAccessException, std::string(functionName) + " requires a valid new key.");
+
+    EXCEPTION_ASSERT_WITH_LOG((keySetNo & 0xF0) == 0,
+        LibLogicalAccessException, std::string(functionName) + " KeySetNo must use bits 0-3 only.");
+
+    // Keep a private copy. The host-side key store is modified only after the card has successfully accepted ChangeKey
+    const auto key = std::make_shared<DESFireKey>(*newKey);
+
+    // This checks only if key type is AES. It does NOT distinguish AES-128 from AES-256
+    EXCEPTION_ASSERT_WITH_LOG(key->getKeyType() == DESFireKeyType::DF_KEY_AES,
+        LibLogicalAccessException, std::string(functionName) + " requires an AES key.");
+
+    const ByteVector keyData = key->getData();
+
+    EXCEPTION_ASSERT_WITH_LOG(keyData.size() == 16 || keyData.size() == 32,
+        LibLogicalAccessException, std::string(functionName) + " requires a 16-byte or 32-byte AES key.");
+
+    const bool piccLevel = crypto->d_currentAid == DUOX_PICC_LEVEL_AID;
+
+    const std::uint8_t targetKeyNo = static_cast<std::uint8_t>(keyNo & 0x3F);
+
+    if (piccLevel)
+        EXCEPTION_ASSERT_WITH_LOG(keySetNo == 0x00,
+            LibLogicalAccessException, std::string(functionName) + " requires KeySetNo = 0 at PICC level.");
+    
+    // Determined before ChangeKey is transmitted because changing the authenticated key invalidates the authentication
+    // For ChangeKeyEV2, KeySetNo != 0 always uses the "different key" encoding
+    const bool changingAuthenticatedKey = keySetNo == 0x00 && targetKeyNo == crypto->d_currentKeyNo;
+
+    const bool authenticatedEV2 = crypto->d_auth_method == CryptoMethod::CM_EV2;
+
+    std::uint8_t commandKeyNo = keyNo;
+
+    const bool piccMasterKey = piccLevel && targetKeyNo == 0x00;
+
+    // bits 6 to 7
+    if (piccMasterKey)
+        commandKeyNo = static_cast<std::uint8_t>(targetKeyNo | (keyData.size() == 16 ? 0x80 : 0xC0));
+
+    const auto oldKey = crypto->getKey(keySetNo, targetKeyNo);
+
+    const ByteVector oldKeyDiversify = oldKey != nullptr ? getKeyInformations(oldKey, targetKeyNo) : ByteVector();
+
+    const ByteVector newKeyDiversify = getKeyInformations(key, targetKeyNo);
+
+    const ByteVector keyDataPlain = crypto->buildDUOXChangeKeyData(keySetNo, commandKeyNo, oldKeyDiversify, key, newKeyDiversify);
+
+    const ByteVector params = isChangeKey ? ByteVector{commandKeyNo} : ByteVector{keySetNo, commandKeyNo};
+
+    const std::uint8_t instruction = isChangeKey ? DUOX_INS_CHANGE_KEY : DUOX_INS_CHANGE_KEY_EV2;
+
+    ISO7816Response response;
+    if (!authenticatedEV2)
+    {
+        // Not authenticated / no EV2 secure messaging
+        response = transmitDUOX(instruction, params, keyDataPlain, DUOXCommunicationMode::Plain);
+    }
+    else if (changingAuthenticatedKey)
+    {
+        // EV2 secure messaging applies but plain response because ChangeKey invalidates the authentication
+        ByteVector integrityInput;
+        integrityInput.reserve(1 + params.size());
+        integrityInput.push_back(instruction);
+        integrityInput.insert(integrityInput.end(), params.begin(), params.end());
+
+        const ByteVector securedData = crypto->desfireEncrypt(keyDataPlain, integrityInput);
+
+        // The response must NOT be processed with the EV2 session because
+        // changing the authenticated key invalidates that authentication
+        ByteVector command;
+        command.reserve(params.size() + securedData.size());
+        command.insert(command.end(), params.begin(), params.end());
+        command.insert(command.end(), securedData.begin(), securedData.end());
+
+        response = DESFireISO7816Commands::transmit(instruction, command);
+    }
+    else
+    {
+        // Normal EV2 CommMode.Full where command is protected and response is MAC-protected/decrypted
+        response = transmitDUOX(instruction, params, keyDataPlain, DUOXCommunicationMode::Full);
+    }
+
+    checkSuccess(response, DUOX_SUCCESS, __func__);
+
+    // The card accepted the operation, therefore update the local crypto key store
+    crypto->setKey(crypto->d_currentAid, keySetNo, targetKeyNo, key);
+
+    // ChangeKey of the authenticated key invalidates EV2 authentication
+    if (changingAuthenticatedKey)
+        crypto->invalidateAuthentication();
+}
+
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+
+void DUOXISO7816Commands::isoGeneralAuthenticate(
+    std::uint8_t caRootKeyNo, std::uint8_t secondaryCaRootKeyNo, CurveID curve,
+    bool mutualAuthentication, bool certificatePresent, std::uint8_t certFileNo,
+    std::uint8_t privateKeyNo, const ByteVector &privateKey,
+    const ByteVector &certificate)
+{
+    auto &auth = d_duoxECCAuthentication;
+
+    EXCEPTION_ASSERT_WITH_LOG(!auth.active,
+        LibLogicalAccessException, "DUOX ECC authentication is already in progress.");
+
+    EXCEPTION_ASSERT_WITH_LOG(caRootKeyNo <= 0x07,
+        LibLogicalAccessException, "DUOX CA Root Key number must fit into P2 bits 0-2.");
+
+    EXCEPTION_ASSERT_WITH_LOG(secondaryCaRootKeyNo <= 0x07,
+        LibLogicalAccessException, "DUOX secondary CA Root Key number must fit into P2 bits 4-6.");
+
+    if (mutualAuthentication)
+    {
+        EXCEPTION_ASSERT_WITH_LOG(privateKeyNo <= 0x07,
+            LibLogicalAccessException, "DUOX private key number must fit into bits 0-2.");
+
+        EXCEPTION_ASSERT_WITH_LOG(!privateKey.empty(),
+            LibLogicalAccessException, "DUOX mutual authentication requires a reader private key.");
+
+        const std::size_t coordinateSize = getCoordinateSize(curve);
+
+        EXCEPTION_ASSERT_WITH_LOG(privateKey.size() == coordinateSize,
+            LibLogicalAccessException, "Invalid DUOX reader private key size.");
+    }
+    else
+    {
+        // PrivateKeyNo and Priv.A are not used for reader-unilateral authentication
+        EXCEPTION_ASSERT_WITH_LOG(privateKey.empty(),
+            LibLogicalAccessException, "Reader private key must be omitted for unilateral authentication.");
+    }
+
+    if (certificatePresent)
+    {
+        EXCEPTION_ASSERT_WITH_LOG(!certificate.empty(),
+            LibLogicalAccessException, "Cert.A is required when certificate authentication is enabled.");
+
+        EXCEPTION_ASSERT_WITH_LOG(certificate.size() <= 880,
+            LibLogicalAccessException, "DUOX Certificate.A exceeds the maximum supported certificate size.");
+    }
+    else
+    {
+        EXCEPTION_ASSERT_WITH_LOG(certificate.empty(),
+            LibLogicalAccessException, "Cert.A must be empty when certificate authentication is disabled.");
+    }
+
+    /*
+     * Part 1 creates the authentication state.
+     *
+     * Part 2 MUST immediately follow it. No other card command is permitted between the two commands
+     */
+    try
+    {
+        isoGeneralAuthenticatePart1(caRootKeyNo, secondaryCaRootKeyNo, curve, mutualAuthentication,
+                                    certificatePresent, certFileNo, privateKeyNo);
+        isoGeneralAuthenticatePart2(privateKey, certificate);
+    }
+    catch (...)
+    {
+        /*
+         * Authentication context is invalid after any failure.
+         *
+         * This also guarantees that ephemeral private material is released after a failed authentication
+         */
+        auth = DUOXECCAuthenticationState{};
+        throw;
+    }
+}
+
+void DUOXISO7816Commands::isoGeneralAuthenticatePart1(
+    std::uint8_t caRootKeyNo, std::uint8_t secondaryCaRootKeyNo, CurveID curve,
+    bool mutualAuthentication, bool certificatePresent, std::uint8_t certFileNo,
+    std::uint8_t privateKeyNo)
+{
+    printInfo("=== ISOGeneralAuthenticate Part 1 DEBUG ===");
+
+    if (mutualAuthentication)
+        EXCEPTION_ASSERT_WITH_LOG(privateKeyNo <= 0x07,
+            LibLogicalAccessException, "DUOX private key number must fit into bits 0-2.");
+
+    const std::uint8_t authMethod = mutualAuthentication
+                                        ? (certificatePresent ? 0x80 : 0xA0)
+                                        : (certificatePresent ? 0x40 : 0x60);
+
+    const ByteVector optsA = buildDUOXOptsA(mutualAuthentication, certificatePresent, certFileNo, privateKeyNo);
+
+    if (mutualAuthentication && certificatePresent)
+        EXCEPTION_ASSERT_WITH_LOG(optsA.size() == 6,
+            LibLogicalAccessException, "Unexpected OptsA size for mutual authentication with certificate.");
+
+    /*
+     * Generate :
+     *   E.Priv.A
+     *   E.Pub.A
+     * The private key must never leave the authentication state
+     */
+    const ECKeyPair ephemeralKeyPair = generateECKeyPair(curve);
+
+    EXCEPTION_ASSERT_WITH_LOG(validateECPoint(curve, ephemeralKeyPair.publicKey),
+        LibLogicalAccessException, "Generated DUOX ephemeral public key is invalid.");
+
+    const ByteVector encodedEphemeralA = encodeECPoint(curve, ephemeralKeyPair.publicKey);
+
+    EXCEPTION_ASSERT_WITH_LOG(encodedEphemeralA.size() == 65,
+        LibLogicalAccessException, "P-256 E.Pub.A must be exactly 65 bytes.");
+
+    EXCEPTION_ASSERT_WITH_LOG(encodedEphemeralA[0] == 0x04,
+        LibLogicalAccessException, "E.Pub.A must use uncompressed point representation.");
+
+    const ByteVector authenticationData = buildDUOXAuthenticationData(encodedEphemeralA);
+
+    EXCEPTION_ASSERT_WITH_LOG(authenticationData.size() == 69,
+        LibLogicalAccessException, "DUOX AuthenticationData must be 69 bytes.");
+
+    const std::uint8_t p2 = buildDUOXGeneralAuthenticateP2(caRootKeyNo, secondaryCaRootKeyNo, true);
+
+    ByteVector commandData;
+    commandData.reserve(optsA.size() + authenticationData.size());
+
+    commandData.insert(commandData.end(), optsA.begin(), optsA.end());
+    commandData.insert(commandData.end(), authenticationData.begin(), authenticationData.end());
+
+    // Part 1 normally fits in a short APDU (use the extended path if necessary)
+    EXCEPTION_ASSERT_WITH_LOG(commandData.size() <= 0xFFFF,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticate Part 1 command is too large.");
+
+    printInfo("Part 1 : mutual=" + std::to_string(mutualAuthentication) +
+              ", certificate=" + std::to_string(certificatePresent) +
+              ", CA root=" + std::to_string(caRootKeyNo) +
+              ", secondary CA root=" + std::to_string(secondaryCaRootKeyNo) +
+              ", curve=" + std::to_string(static_cast<unsigned int>(curve)) +
+              ", certFileNo=" + std::to_string(certFileNo) +
+              ", privateKeyNo=" + std::to_string(privateKeyNo));
+
+    debugBytes("Part 1 : OptsA", optsA);
+
+    printInfo("Part 1 : sending General Authenticate, Lc=" +
+              std::to_string(commandData.size()) + ", P2=0x" + hexDump(ByteVector{p2}));
+
+    const ISO7816Response response = sendDUOXGeneralAuthenticate(p2, commandData, 0x0000); // TODO change Le later
+
+    const std::uint8_t sw1 = response.getSW1();
+    const std::uint8_t sw2 = response.getSW2();
+    const bool success = sw1 == 0x90 && sw2 == 0x00;
+    const bool versionFallback = sw1 == 0x9F && sw2 == 0x00;
+
+    EXCEPTION_ASSERT_WITH_LOG(success || versionFallback,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticate Part 1 failed.");
+
+    printInfo("Part 1 : response SW=0x" + hexDump(ByteVector{sw1, sw2}) +
+              ", data=" + std::to_string(response.getData().size()) + " bytes.");
+
+    const ECPoint ephemeralPublicB = parseDUOXAuthenticationResponse(response.getData(), curve);
+    const ByteVector encodedEphemeralB = encodeECPoint(curve, ephemeralPublicB);
+
+    EXCEPTION_ASSERT_WITH_LOG(encodedEphemeralB.size() == 65,
+        LibLogicalAccessException, "PICC E.Pub.B must be exactly 65 bytes.");
+
+    EXCEPTION_ASSERT_WITH_LOG(encodedEphemeralB[0] == 0x04,
+        LibLogicalAccessException, "PICC E.Pub.B must be uncompressed.");
+
+    EXCEPTION_ASSERT_WITH_LOG(validateECPoint(curve, ephemeralPublicB),
+        LibLogicalAccessException, "PICC returned an invalid E.Pub.B point.");
+
+     // ECDH : ShS = ECDH(E.Priv.A, E.Pub.B)
+    const ByteVector sharedSecret = deriveECDHSharedSecret(curve, ephemeralKeyPair.privateKey, ephemeralPublicB);
+
+    EXCEPTION_ASSERT_WITH_LOG(!sharedSecret.empty(),
+        LibLogicalAccessException, "DUOX ECDH produced an empty shared secret.");
+
+    // Derive K_SESAuthENC K_SESAuthMAC
+    const SessionKeys sessionKeys = deriveSessionKeys(ephemeralKeyPair.publicKey, ephemeralPublicB, sharedSecret);
+
+    EXCEPTION_ASSERT_WITH_LOG(sessionKeys.encKey.size() == 16,
+        LibLogicalAccessException, "DUOX session ENC key must be 16 bytes.");
+
+    EXCEPTION_ASSERT_WITH_LOG(sessionKeys.macKey.size() == 16,
+        LibLogicalAccessException, "DUOX session MAC key must be 16 bytes.");
+
+    DUOXECCAuthenticationState newAuth;
+    newAuth.active               = true;
+    newAuth.curve                = curve;
+    newAuth.mutualAuthentication = mutualAuthentication;
+    newAuth.certificatePresent   = certificatePresent;
+    newAuth.caRootKeyNo          = caRootKeyNo;
+    newAuth.secondaryCaRootKeyNo = secondaryCaRootKeyNo;
+    newAuth.certFileNo   = certFileNo;
+    newAuth.privateKeyNo = privateKeyNo;
+    newAuth.optsA = optsA;
+    newAuth.ephemeralPrivateKey = ephemeralKeyPair.privateKey;
+    newAuth.ephemeralPublicA    = ephemeralKeyPair.publicKey;
+    newAuth.ephemeralPublicB    = ephemeralPublicB;
+    newAuth.sessionKeys = sessionKeys;
+
+    d_duoxECCAuthentication = std::move(newAuth);
+
+    printInfo("Part 1 completed : certificatePresent=" + std::to_string(d_duoxECCAuthentication.certificatePresent));
+    printInfo("=== ISOGeneralAuthenticate Part 1 DEBUG COMPLETE ===");
+}
+
+//TODO Keeping this here temporarily for readability. Will be refactored and correctly integrated into the project later.
+namespace 
+{
+ByteVector padDUOXAES(const ByteVector &data)
+{
+    constexpr std::size_t blockSize = 16;
+
+    ByteVector padded = data;
+
+    const std::size_t padding = blockSize - (padded.size() % blockSize);
+
+    padded.push_back(0x80);
+    padded.insert(padded.end(), padding - 1, 0x00);
+
+    return padded;
+}
+
+ByteVector unpadDUOXAES(const ByteVector &data)
+{
+    EXCEPTION_ASSERT_WITH_LOG(!data.empty() && data.size() % 16 == 0,
+        LibLogicalAccessException, "Invalid DUOX AES padded data.");
+
+    std::size_t pos = data.size();
+
+    while (pos > 0 && data[pos - 1] == 0x00)
+        --pos;
+
+    EXCEPTION_ASSERT_WITH_LOG(pos > 0 && data[pos - 1] == 0x80,
+        LibLogicalAccessException, "Invalid DUOX AES padding.");
+
+    return ByteVector(data.begin(), data.begin() + pos - 1);
+}
+
+}
+void DUOXISO7816Commands::isoGeneralAuthenticatePart2(const ByteVector &privateKey, const ByteVector &certificate)
+{
+    printInfo("Executing ISOGeneralAuthenticate Part 2.");
+
+    auto &auth = d_duoxECCAuthentication;
+
+    EXCEPTION_ASSERT_WITH_LOG(auth.active,LibLogicalAccessException,
+                              "DUOX ISOGeneralAuthenticatePart2 called without an active ISOGeneralAuthenticate Part 1.");
+
+    const bool certAExpected = auth.certificatePresent;
+    const bool certAProvided = !certificate.empty();
+
+    EXCEPTION_ASSERT_WITH_LOG(
+        certAExpected == certAProvided,LibLogicalAccessException,
+        (certAExpected
+             ? "DUOX Part 2 requires Cert.A, but no certificate was provided."
+             : "DUOX Part 2 must omit Cert.A, but a certificate was provided."));
+
+    // Part 1 has already established the curve
+    const CurveID curve              = auth.curve;
+    const std::size_t coordinateSize = getCoordinateSize(auth.curve);
+
+    EXCEPTION_ASSERT_WITH_LOG(privateKey.size() == coordinateSize,
+        LibLogicalAccessException, "DUOX static private key does not match the authentication curve.");
+
+    // In the no-Cert.A variants the caller must not provide a certificate
+    if (certAExpected)
+    {
+        EXCEPTION_ASSERT_WITH_LOG(certificate.size() <= 880,
+            LibLogicalAccessException, "DUOX Certificate.A exceeds the maximum supported certificate chain size.");
+
+        EXCEPTION_ASSERT_WITH_LOG(certificate.size() >= 4,
+            LibLogicalAccessException, "DUOX Cert.A is too short to be a DER certificate.");
+
+        EXCEPTION_ASSERT_WITH_LOG(certificate[0] == 0x30,
+            LibLogicalAccessException, "DUOX Cert.A does not start with a DER SEQUENCE.");
+    }
+    else
+        EXCEPTION_ASSERT_WITH_LOG(certificate.empty(),
+            LibLogicalAccessException, "Certificate.A must be omitted for this authentication variant.");
+
+    printInfo("Part 2 : certificate=" + std::string(certAExpected ? "present" : "omitted") +
+        ", Cert.A size=" + std::to_string(certificate.size()) +
+        ", private key size=" + std::to_string(privateKey.size()));
+
+    const ByteVector encodedPublicA = encodeECPoint(curve, auth.ephemeralPublicA);
+    const ByteVector encodedPublicB = encodeECPoint(curve, auth.ephemeralPublicB);
+
+    printInfo("E.Pub.A = " + hexDump(encodedPublicA));
+    printInfo("E.Pub.B = " + hexDump(encodedPublicB));
+    printInfo("E.Pub.A.x = " + hexDump(ByteVector(encodedPublicA.begin() + 1, encodedPublicA.begin() + 33)));
+    printInfo("E.Pub.B.x = " + hexDump(ByteVector(encodedPublicB.begin() + 1, encodedPublicB.begin() + 33)));
+
+    ByteVector signedMessage;
+    signedMessage.reserve(2 + auth.optsA.size() + encodedPublicA.size() + encodedPublicB.size());
+
+    signedMessage.push_back(0xE0);
+    signedMessage.push_back(0xE0);
+    signedMessage.insert(signedMessage.end(), auth.optsA.begin(), auth.optsA.end());
+    signedMessage.insert(signedMessage.end(), encodedPublicA.begin(), encodedPublicA.end());
+    signedMessage.insert(signedMessage.end(), encodedPublicB.begin(), encodedPublicB.end());
+
+    // Generate ECDSA signature using the static reader private key.
+    // performDUOXECDSASign() performs SHA-256 internally
+    const ECDSASignature signature = signECDSA(curve, privateKey, signedMessage);
+
+    EXCEPTION_ASSERT_WITH_LOG(signature.r.size() == 32 && signature.s.size() == 32,
+        LibLogicalAccessException, "DUOX ECDSA signature has an invalid size.");
+
+    // The signature in Msg.A.pl is DER encoded
+    const ByteVector encodedSignature = encodeECDSASignatureDER(signature);
+
+    EXCEPTION_ASSERT_WITH_LOG(!encodedSignature.empty(),
+        LibLogicalAccessException, "Unable to encode DUOX ECDSA signature.");
+
+    // TEST ONLY (verify the signature using the public key from the exact Cert.A that we are about to send to the card
+    verifySignatureWithCertificate(certificate, signedMessage, signature);
+
+    ByteVector plaintext;
+    plaintext.reserve(2 + (auth.certificatePresent ? certificate.size() : 0) + encodedSignature.size());
+
+    plaintext.push_back(0xE0);
+    plaintext.push_back(0xE0);
+    if (auth.certificatePresent)
+        plaintext.insert(plaintext.end(), certificate.begin(), certificate.end());
+    plaintext.insert(plaintext.end(), encodedSignature.begin(), encodedSignature.end());
+
+    const std::size_t expectedPlaintextSize = 2 + (certAExpected ? certificate.size() : 0) + encodedSignature.size();
+
+    if (plaintext.size() != expectedPlaintextSize)
+    {
+        throw std::runtime_error("Msg.A.pl size mismatch: expected " +
+            std::to_string(expectedPlaintextSize) + ", got " + std::to_string(plaintext.size()) + ".");
+    }
+    if (plaintext[0] != 0xE0 || plaintext[1] != 0xE0)
+        throw std::runtime_error("Msg.A.pl does not start with E0 E0.");
+    const std::size_t signatureOffset = 2 + (certAExpected ? certificate.size() : 0);
+
+    if (!std::equal(certificate.begin(), certificate.end(), plaintext.begin() + 2))
+        throw std::runtime_error("Cert.A embedded in Msg.A.pl does not match the supplied certificate.");
+
+    if (!std::equal(encodedSignature.begin(), encodedSignature.end(), plaintext.begin() + signatureOffset))
+        throw std::runtime_error("Sig.A embedded in Msg.A.pl does not match generated Sig.A.");
+
+    if (!certAExpected && plaintext.size() != 2 + encodedSignature.size())
+        throw std::runtime_error("Msg.A.pl contains unexpected Cert.A bytes.");
+
+    printInfo("Part 2: Msg.A.pl=" + std::to_string(plaintext.size()) +
+              " bytes, Cert.A=" + std::to_string(certAExpected ? certificate.size() : 0) +
+              " bytes, Sig.A=" + std::to_string(encodedSignature.size()) + " bytes.");
+
+    const ByteVector paddedPlaintext = padDUOXAES(plaintext);
+    const ByteVector iv(16, 0x00);
+
+    printInfo("=== DUOX AUTH CRYPTO DEBUG ===");
+    printInfo("E.Pub.A = " + hexDump(encodedPublicA));
+    printInfo("E.Pub.B = " + hexDump(encodedPublicB));
+
+    const ByteVector xA(encodedPublicA.begin() + 1, encodedPublicA.begin() + 33);
+    const ByteVector xB(encodedPublicB.begin() + 1, encodedPublicB.begin() + 33);
+    const ByteVector xALast8(xA.end() - 8, xA.end());
+    const ByteVector xBLast8(xB.end() - 8, xB.end());
+    const ByteVector kdfSalt = [&]()
+    {
+        ByteVector v;
+        v.reserve(16);
+        v.insert(v.end(), xALast8.begin(), xALast8.end());
+        v.insert(v.end(), xBLast8.begin(), xBLast8.end());
+        return v;
+    }();
+
+    printInfo("E.Pub.A.x[7..0] = " + hexDump(xALast8));
+    printInfo("E.Pub.B.x[7..0] = " + hexDump(xBLast8));
+    printInfo("KDF salt         = " + hexDump(kdfSalt));
+    printInfo("K_SES_AUTH_ENC    = " + hexDump(auth.sessionKeys.encKey));
+    printInfo("K_SES_AUTH_MAC    = " + hexDump(auth.sessionKeys.macKey));
+    printInfo("Msg.A.pl          = " + hexDump(plaintext));
+    printInfo("Msg.A.pl size      = " + std::to_string(plaintext.size()));
+    printInfo("Msg.A.padded      = " + hexDump(paddedPlaintext));
+
+    const ByteVector encryptedMessage = AESHelper::AESEncrypt(paddedPlaintext, auth.sessionKeys.encKey, iv);
+
+    printInfo("Msg.A.enc         = " + hexDump(encryptedMessage));
+    printInfo("=== DUOX AUTH CRYPTO DEBUG COMPLETE ===");
+
+    EXCEPTION_ASSERT_WITH_LOG(!encryptedMessage.empty() && encryptedMessage.size() % 16 == 0,
+        LibLogicalAccessException, "DUOX encrypted authentication message has an invalid length.");
+
+    auto msgATLV = std::make_shared<TLV>(0x86);
+    msgATLV->value(encryptedMessage);
+
+    auto authDO = std::make_shared<TLV>(0x7C);
+
+    authDO->value(msgATLV);
+
+    const ByteVector commandData = authDO->compute_der();
+
+    EXCEPTION_ASSERT_WITH_LOG(commandData.size() <= 0xFFFF,
+        LibLogicalAccessException, "DUOX Part 2 authentication data is too large.");
+
+    EXCEPTION_ASSERT_WITH_LOG(commandData.size() >= 2, LibLogicalAccessException,
+                              "Invalid DUOX Part 2 authentication data.");
+
+    printInfo("Part 2: sending General Authenticate, Lc=" +
+              std::to_string(commandData.size()) + ".");
+
+    ////// TEST /////
+    const ByteVector decrypted = AESHelper::AESDecrypt(encryptedMessage, auth.sessionKeys.encKey, iv);
+    const ByteVector unpadded = unpadDUOXAES(decrypted);
+    if (unpadded != plaintext)
+    {
+        throw std::runtime_error("Local DUOX Msg.A AES round-trip failed.");
+    }
+    printInfo("Local Msg.A AES encryption/decryption round-trip verified.");
+    /////////////////
+
+    const ISO7816Response response = sendDUOXGeneralAuthenticate(0x00, commandData, 0x0000);
+
+    const std::uint8_t sw1 = response.getSW1();
+    const std::uint8_t sw2 = response.getSW2();
+
+    // Part 2 only accepts ISO 9000 as successful completion
+    EXCEPTION_ASSERT_WITH_LOG(sw1 == 0x90 && sw2 == 0x00,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticatePart2 failed.");
+
+    const ByteVector responseData = response.getData();
+
+    auto responseTLVs = TLV::parse_tlvs_der(responseData);
+
+    EXCEPTION_ASSERT_WITH_LOG(responseTLVs.size() == 1,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticatePart2 returned an invalid authentication data structure.");
+
+    EXCEPTION_ASSERT_WITH_LOG(responseTLVs[0]->tag() == 0x7C,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticatePart2 returned an invalid authentication data object tag.");
+
+    auto responseAuthenticationTLVs = TLV::parse_tlvs_der(responseTLVs[0]->value());
+
+    EXCEPTION_ASSERT_WITH_LOG(responseAuthenticationTLVs.size() == 1, LibLogicalAccessException,
+        "DUOX ISOGeneralAuthenticatePart2 returned an invalid authentication data object count.");
+
+    EXCEPTION_ASSERT_WITH_LOG(responseAuthenticationTLVs[0]->tag() == 0x82,
+        LibLogicalAccessException, "DUOX ISOGeneralAuthenticatePart2 returned an invalid Msg.B.enc tag.");
+
+    const ByteVector encryptedMsgB = responseAuthenticationTLVs[0]->value();
+
+    EXCEPTION_ASSERT_WITH_LOG(!encryptedMsgB.empty() && encryptedMsgB.size() % 16 == 0,
+        LibLogicalAccessException, "DUOX Msg.B.enc has an invalid encrypted length.");
+
+    const ByteVector paddedMsgB =
+        AESHelper::AESDecrypt(encryptedMsgB, auth.sessionKeys.encKey, iv);
+
+    const ByteVector msgB = unpadDUOXAES(paddedMsgB);
+
+    EXCEPTION_ASSERT_WITH_LOG(msgB.size() >= 2,
+        LibLogicalAccessException, "DUOX decrypted Msg.B is too short.");
+
+    EXCEPTION_ASSERT_WITH_LOG(msgB[0] == 0xE1 && msgB[1] == 0xE1,
+        LibLogicalAccessException, "DUOX Msg.B has an invalid protocol marker.");
+
+    EXCEPTION_ASSERT_WITH_LOG(msgB.size() >= 3,
+        LibLogicalAccessException, "DUOX Msg.B is missing OptsB.");
+
+    const std::size_t optsBLength = msgB[2];
+
+    EXCEPTION_ASSERT_WITH_LOG(msgB.size() >= 3 + optsBLength,
+        LibLogicalAccessException, "DUOX Msg.B contains a truncated OptsB.");
+
+    ByteVector optsB(msgB.begin() + 2, msgB.begin() + 3 + optsBLength);
+
+    const std::size_t msgBPayloadOffset = 3 + optsBLength;
+
+    printInfo("Part 2: received Msg.B.enc=" + std::to_string(encryptedMsgB.size()) +
+              " bytes, OptsB=" + std::to_string(optsB.size()) + " bytes.");
+
+    if (auth.mutualAuthentication)
+    {
+        EXCEPTION_ASSERT_WITH_LOG(
+            msgB.size() > msgBPayloadOffset,
+            LibLogicalAccessException, "DUOX mutual authentication response is missing Cert.B/Sig.B.");
+
+        printInfo("Part 2: mutual authentication response contains Cert.B/Sig.B payload (" +
+                  std::to_string(msgB.size() - msgBPayloadOffset) + " bytes).");
+    }
+    else
+    {
+        EXCEPTION_ASSERT_WITH_LOG(
+            msgB.size() == msgBPayloadOffset,
+            LibLogicalAccessException, "DUOX reader-unilateral authentication returned unexpected additional data.");
+    }
+
+    printInfo("ISOGeneralAuthenticate Part 2 completed.");
+}
+
+ISO7816Response DUOXISO7816Commands::sendDUOXGeneralAuthenticate(std::uint8_t p2,
+                                                                 const ByteVector &data,
+                                                                 std::uint16_t le)
+{
+    auto adapter = getISO7816ReaderCardAdapter();
+
+    EXCEPTION_ASSERT_WITH_LOG(adapter != nullptr,
+        LibLogicalAccessException, "ISO7816 reader/card adapter is required.");
+
+    EXCEPTION_ASSERT_WITH_LOG(data.size() <= 0xFFFF,
+        LibLogicalAccessException, "DUOX General Authenticate data is too large.");
+
+    printInfo("sendDUOXGeneralAuthenticate() :");
+    printInfo(" CLA = 00");
+    printInfo(" INS = 87");
+    printInfo(" P1  = 00");
+    printInfo(" P2  = " + hexDump(ByteVector{p2}));
+    printInfo(" Lc  = " + std::to_string(data.size()));
+    debugBytes(" Data", data);
+    printInfo(" Le  = 00 00");
+
+    if (data.size() <= 0xFF && le <= 0xFF)
+    {
+        printInfo("Using normal length APDU: Lc=" + std::to_string(data.size()) + ", Le=" + std::to_string(le));
+
+        return adapter->sendAPDUCommand(ISO7816_CLA_ISO_COMPATIBLE, ISO7816_INS_GENERAL_AUTHENTICATE, 0x00, p2,
+                                        static_cast<unsigned char>(data.size()), data, static_cast<unsigned char>(le));
+    }
+    
+    printInfo("Using extended-length APDU: Lc=" + std::to_string(data.size()) + ", Le=" + std::to_string(le));
+    return adapter->sendExtendedAPDUCommand(ISO7816_CLA_ISO_COMPATIBLE, ISO7816_INS_GENERAL_AUTHENTICATE, 0x00, p2,
+                                            static_cast<unsigned short>(data.size()), data, le);
+}
+
+std::uint8_t DUOXISO7816Commands::buildDUOXGeneralAuthenticateP2(std::uint8_t caRootKeyNo,
+                                                    std::uint8_t secondaryCaRootKeyNo,
+                                                    bool multipleApplicationSelection)
+{
+    EXCEPTION_ASSERT_WITH_LOG(caRootKeyNo <= 0x07,
+        LibLogicalAccessException, "Invalid DUOX CA root key number.");
+
+    if (multipleApplicationSelection)
+        EXCEPTION_ASSERT_WITH_LOG(secondaryCaRootKeyNo <= 0x07,
+            LibLogicalAccessException, "Invalid DUOX secondary CA root key number.");
+
+    return static_cast<std::uint8_t>(caRootKeyNo | (multipleApplicationSelection ?
+        static_cast<std::uint8_t>(secondaryCaRootKeyNo << 4) : 0x00));
+}
+
+ByteVector DUOXISO7816Commands::buildDUOXOptsA(bool mutualAuthentication, bool certificateAIncluded,
+                                               std::uint8_t certificateFileNo, std::uint8_t privateKeyNo)
+{
+    std::uint8_t authMethod;
+
+    if (mutualAuthentication)
+    {
+        authMethod = certificateAIncluded ? 0x80 : 0xA0;
+    }
+    else
+    {
+        authMethod = certificateAIncluded ? 0x40 : 0x60;
+    }
+
+    ByteVector value;
+    value.push_back(authMethod);
+    value.push_back(0x00); // ProtocolVersion
+
+    if (mutualAuthentication)
+    {
+        value.push_back(certificateFileNo);
+        value.push_back(privateKeyNo);
+    }
+
+    ByteVector result;
+    result.push_back(0x80);
+    result.push_back(static_cast<std::uint8_t>(value.size())); // For OptsA length is currently only 2 or 4
+    result.insert(result.end(), value.begin(), value.end());
+
+    return result;
+}
+
+ByteVector DUOXISO7816Commands::buildDUOXAuthenticationData(const ByteVector &ephemeralPublicKey)
+{
+    EXCEPTION_ASSERT_WITH_LOG(ephemeralPublicKey.size() == 65,
+        LibLogicalAccessException, "DUOX ephemeral public key must contain 65 bytes.");
+
+    ByteVector result;
+
+    // Authentication Data Objects header
+    result.push_back(0x7C);
+    result.push_back(0x43);
+
+    // E.Pub.A
+    result.push_back(0x85);
+    result.push_back(0x41);
+
+    result.insert(result.end(), ephemeralPublicKey.begin(), ephemeralPublicKey.end());
+
+    return result;
+}
+
+// TODO Outdated. Refactor after Part2 is completely refactored.
+ECPoint DUOXISO7816Commands::parseDUOXAuthenticationResponse(const ByteVector &response, CurveID curve)
+{
+    const auto tlvs = TLV::parse_tlvs_der(response, true);
+
+    EXCEPTION_ASSERT_WITH_LOG(tlvs.size() == 1,
+        LibLogicalAccessException, "Expected exactly one DUOX authentication TLV.");
+
+    auto authDO = tlvs[0];
+
+    EXCEPTION_ASSERT_WITH_LOG(authDO->tag() == 0x7C,
+        LibLogicalAccessException, "Expected DUOX authentication data object 7C.");
+
+    const auto children = TLV::parse_tlvs_der(authDO->value(), true);
+
+    EXCEPTION_ASSERT_WITH_LOG(children.size() == 1,
+        LibLogicalAccessException, "Expected exactly one DUOX authentication child.");
+
+    EXCEPTION_ASSERT_WITH_LOG(children[0]->tag() == 0x85,
+        LibLogicalAccessException, "Expected DUOX E.Pub.B tag 85.");
+
+    const ByteVector encodedPoint = children[0]->value();
+
+    EXCEPTION_ASSERT_WITH_LOG(encodedPoint.size() == 65,
+        LibLogicalAccessException, "DUOX E.Pub.B must contain 65 bytes.");
+
+    const ECPoint point = decodeECPoint(curve, encodedPoint);
+    return point;
+}
+
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+
+
+// -------------------------------------------------------------------------
 // DESFire EV2
-// ------------------
-void DUOXISO7816Commands::changeKeyEV2(uint8_t keyset, uint8_t keyno,
+// -------------------------------------------------------------------------
+
+//TODO Merge later between EV2/EV3 usage and DUOX usage
+/*void DUOXISO7816Commands::changeKeyEV2(uint8_t keyset, uint8_t keyno,
                                        std::shared_ptr<DESFireKey> key)
 {
     DESFireEV3ISO7816Commands::changeKeyEV2(keyset, keyno, key);
-}
+}*/
 
 void DUOXISO7816Commands::authenticateEV2First(uint8_t keyno,
                                                std::shared_ptr<DESFireKey> key)
@@ -1157,9 +2032,9 @@ bool DUOXISO7816Commands::performECCOriginalityCheck()
     return DESFireEV3ISO7816Commands::performECCOriginalityCheck();
 }
 
-// ------------------
+// -------------------------------------------------------------------------
 // DESFire EV3
-// ------------------
+// -------------------------------------------------------------------------
 ByteVector DUOXISO7816Commands::getFileCounters(unsigned char fileno)
 {
     return DESFireEV3ISO7816Commands::getFileCounters(fileno);

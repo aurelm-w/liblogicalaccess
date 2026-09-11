@@ -91,6 +91,10 @@ class LLA_CARDS_DESFIRE_API DESFireEV2Crypto : public DESFireCrypto
                               ByteVector newKeyDiversify,
                               unsigned char keysetno = 0) override;
 
+    // TODO Create duoxcrypto.hpp and move this inside 
+    ByteVector buildDUOXChangeKeyData(std::uint8_t keySetNo, std::uint8_t keyNo, const ByteVector &oldKeyDiversify,
+                              std::shared_ptr<DESFireKey> newKey, const ByteVector &newKeyDiversify);
+
     void duplicateCurrentKeySet(uint8_t keySetNb);
 
     void duplicateKeySet(uint8_t keySetNb, uint8_t keySetNbToDuplicate);
@@ -103,6 +107,18 @@ class LLA_CARDS_DESFIRE_API DESFireEV2Crypto : public DESFireCrypto
     ByteVector d_macSessionKey;
 
     static ByteVector truncateMAC(const ByteVector &full_mac);
+
+    /**
+     * \brief Invalidates the current authentication session
+     *
+     * Clears all authentication and secure-messaging state, including session keys, authentication nonces,
+     * transaction state, and secure-messaging chaining state
+     *
+     * The application selection and configured key store are preserved
+     *
+     * This must be called whenever the current authentication session is no longer valid and must not be reused
+     */
+    void invalidateAuthentication(); // TODO Create duoxcrypto.hpp and move this inside
 
   private:
     ByteVector getIVEncrypt(bool cmdData);

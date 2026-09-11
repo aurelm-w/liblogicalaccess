@@ -5,27 +5,27 @@
 #include <vector>
 
 #include <logicalaccess/plugins/cards/desfire/desfireev3commands.hpp>
+#include <logicalaccess/plugins/cards/desfire/lla_cards_desfire_api.hpp>
+
+#include "duoxecc.hpp"
 
 namespace logicalaccess
 {
-/**
- * \brief Curve identifiers supported by MIFARE DUOX asymmetric commands
- *
- * These values are the values transmitted to the card
- */
-enum class DUOXCurveID : std::uint8_t
+
+// TODO Move it somewhere else later, required for current .hpp
+enum class DUOXChangeKeyCommand
 {
-    NIST_P256        = 0x0C,
-    BRAINPOOL_P256R1 = 0x0D
+    ChangeKey,
+    ChangeKeyEV2
 };
 
 /**
  * \brief Options for the DUOX ManageKeyPair command
  *
  * ManageKeyPair (0x46) supports :
- *  - generating a new key pair,
- *  - importing a private key,
- *  - updating the metadata of an existing key pair
+ *  - Generating a new key pair
+ *  - Importing a private key
+ *  - Updating the metadata of an existing key pair
  */
 enum class DUOXManageKeyPairOption : std::uint8_t
 {
@@ -52,7 +52,7 @@ enum class DUOXCommunicationMode : std::uint8_t
 struct DUOXECCPrivateKeyMetadata
 {
     std::uint8_t keyNo;
-    DUOXCurveID curveId;
+    CurveID curveId;
     std::uint16_t keyPolicy;
     std::uint8_t writeAccess;
     std::uint32_t keyUsageCtrLimit;
@@ -60,7 +60,7 @@ struct DUOXECCPrivateKeyMetadata
 
     DUOXECCPrivateKeyMetadata()
         : keyNo(0)
-        , curveId(DUOXCurveID::NIST_P256)
+        , curveId(CurveID::NIST_P256)
         , keyPolicy(0)
         , writeAccess(0)
         , keyUsageCtrLimit(0)
@@ -72,7 +72,7 @@ struct DUOXECCPrivateKeyMetadata
 struct DUOXCARootKeyMetadata
 {
     std::uint8_t keyNo;
-    DUOXCurveID curveId;
+    CurveID curveId;
     std::uint16_t accessRights;
     std::uint8_t writeAccess;
     std::uint8_t readAccess;
@@ -81,7 +81,7 @@ struct DUOXCARootKeyMetadata
 
     DUOXCARootKeyMetadata()
         : keyNo(0)
-        , curveId(DUOXCurveID::NIST_P256)
+        , curveId(CurveID::NIST_P256)
         , accessRights(0)
         , writeAccess(0)
         , readAccess(0)
@@ -91,7 +91,7 @@ struct DUOXCARootKeyMetadata
     }
 };
 
-enum class DUOXGetKeySettingsResponseType : std::uint8_t
+enum class DUOXKeySettingsOption : std::uint8_t
 {
     KeySettings,
     ECCPrivateKeyMetadata,
@@ -100,7 +100,7 @@ enum class DUOXGetKeySettingsResponseType : std::uint8_t
 
 struct DUOXKeySettings
 {
-    DUOXGetKeySettingsResponseType responseType;
+    DUOXKeySettingsOption responseType;
 
     bool piccLevel;
 
@@ -120,7 +120,7 @@ struct DUOXKeySettings
     std::vector<DUOXCARootKeyMetadata> caRootKeys;
 
     DUOXKeySettings()
-        : responseType(DUOXGetKeySettingsResponseType::KeySettings)
+        : responseType(DUOXKeySettingsOption::KeySettings)
         , piccLevel(false)
         , keySettings(0)
         , maxNoOfKeys(0)
@@ -154,15 +154,15 @@ class LLA_CARDS_DESFIRE_API DUOXCommands : public DESFireEV3Commands
     /**
      * \brief Manage an asymmetric private key entry
      *
-     * This implements the DUOX ManageKeyPair command (0x46)
+     * This implements the DUOX ManageKeyPair command
      *
-     * Depending on \p option :
+     * Depending on option :
      *
-     *  - GenerateKeyPair:
+     *  - GenerateKeyPair :
      *      Generates a key pair on the card. The generated public key is returned by the card
      *
      *  - ImportPrivateKey :
-     *      Imports \p privateKey into the selected key slot
+     *      Imports privateKey into the selected key slot
      *
      *  - UpdateMetadata :
      *      Updates the metadata of an existing key pair. The private key itself is not modified
@@ -178,28 +178,51 @@ class LLA_CARDS_DESFIRE_API DUOXCommands : public DESFireEV3Commands
      * \return The generated public key for GenerateKeyPair. For the other operations, the response is empty
      */
     virtual ByteVector manageKeyPair(std::uint8_t keyNo, DUOXManageKeyPairOption option,
-                                     DUOXCurveID curveId, std::uint16_t keyPolicy,
+                                     CurveID curveId, std::uint16_t keyPolicy,
                                      std::uint8_t writeAccess, std::uint32_t kucLimit,
                                      const ByteVector &privateKey = ByteVector(),
                                      DUOXCommunicationMode commMode = DUOXCommunicationMode::Full) = 0;
 
-    //TODO Write comment later
-    virtual void manageCARootKey(std::uint8_t keyNo, DUOXCurveID curveId,
+    //TODO Write brief later
+    virtual void manageCARootKey(std::uint8_t keyNo, CurveID curveId,
                                  std::uint16_t accessRights, std::uint8_t writeAccess,
                                  std::uint8_t readAccess, std::uint8_t crlFile,
                                  std::uint32_t crlFileAid, const ByteVector &publicKey,
                                  const ByteVector &issuer,
                                  DUOXCommunicationMode commMode = DUOXCommunicationMode::Full) = 0;
 
-    // TODO Write comment later
+    // TODO Write brief later
     virtual ByteVector exportKey(std::uint8_t keyNo, DUOXCommunicationMode commMode = DUOXCommunicationMode::Full) = 0;
 
-    virtual void authenticateEV2NonFirst(uint8_t keyno, std::shared_ptr<DESFireKey> currentKey) = 0;
+    virtual void authenticateEV2NonFirst(uint8_t keyno, std::shared_ptr<DESFireKey> currentKey = nullptr) = 0;
 
     virtual std::uint32_t freeMem() = 0;
 
-    virtual DUOXKeySettings getKeySettings() = 0;
-    virtual DUOXKeySettings getKeySettings(std::uint8_t option) = 0;
+    virtual DUOXKeySettings getKeySettings(DUOXKeySettingsOption option = DUOXKeySettingsOption::KeySettings) = 0;
+
+    virtual void changeKey(std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey) = 0;
+    // TODO Rewrite function later
+    //virtual void changeKeyEV2(std::uint8_t keySetNo, std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey) = 0;
+
+    
+    virtual void isoGeneralAuthenticate(std::uint8_t caRootKeyNo,
+                                        std::uint8_t secondaryCaRootKeyNo,
+                                        CurveID curve, bool mutualAuthentication,
+                                        bool certificatePresent, std::uint8_t certFileNo,
+                                        std::uint8_t privateKeyNo,
+                                        const ByteVector &privateKey,
+                                        const ByteVector &certificate) = 0;
+
+    
+    virtual void isoGeneralAuthenticatePart1(std::uint8_t caRootKeyNo,
+                                     std::uint8_t secondaryCaRootKeyNo, CurveID curve,
+                                     bool mutualAuthentication, bool certificatePresent,
+                                     std::uint8_t certFileNo,
+                                     std::uint8_t privateKeyNo) = 0;
+
+    virtual void isoGeneralAuthenticatePart2(const ByteVector &privateKey,
+                                     const ByteVector &certificate) = 0;
+
 
 };
 

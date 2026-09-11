@@ -5,6 +5,42 @@
 
 namespace logicalaccess
 {
+
+// TODO Move this structure to a more appropriate location; no need to do it now, move it when refactoring
+struct DUOXECCAuthenticationState
+{
+    bool active = false;
+
+    CurveID curve = CurveID::NIST_P256;
+
+    bool mutualAuthentication = false;
+    bool certificatePresent   = false;
+
+    std::uint8_t caRootKeyNo          = 0;
+    std::uint8_t secondaryCaRootKeyNo = 0;
+    std::uint8_t certFileNo           = 0;
+    std::uint8_t privateKeyNo         = 0;
+
+    ByteVector optsA;
+
+    /*
+     * Ephemeral ECDH key material.
+     *
+     * The private key must remain local and must be erased when the authentication context is destroyed or reset
+     */
+    ByteVector ephemeralPrivateKey;
+
+    ECPoint ephemeralPublicA;
+    ECPoint ephemeralPublicB;
+
+    /*
+     * Authentication session keys
+     */
+    SessionKeys sessionKeys;
+
+    // TODO EV2/secure-messaging context will be added here once DUOX post-authentication secure messaging format is wired
+};
+
 /**
  * \brief ISO/IEC 7816 command implementation for DUOX cards
  *
@@ -55,12 +91,12 @@ class LLA_READERS_ISO7816_API DUOXISO7816Commands : public DESFireEV3ISO7816Comm
      * Implements the DUOX ManageKeyPair command (0x46).
      */
     ByteVector manageKeyPair(std::uint8_t keyNo, DUOXManageKeyPairOption option,
-                             DUOXCurveID curveId, std::uint16_t keyPolicy,
+                             CurveID curveId, std::uint16_t keyPolicy,
                              std::uint8_t writeAccess, std::uint32_t kucLimit,
                              const ByteVector &privateKey = ByteVector(),
                              DUOXCommunicationMode commMode = DUOXCommunicationMode::Full) override;
 
-    void manageCARootKey(std::uint8_t keyNo, DUOXCurveID curveId,
+    void manageCARootKey(std::uint8_t keyNo, CurveID curveId,
                          std::uint16_t accessRights, std::uint8_t writeAccess,
                          std::uint8_t readAccess, std::uint8_t crlFile,
                          std::uint32_t crlFileAid, const ByteVector &publicKey,
@@ -68,12 +104,14 @@ class LLA_READERS_ISO7816_API DUOXISO7816Commands : public DESFireEV3ISO7816Comm
 
     ByteVector exportKey(std::uint8_t keyNo, DUOXCommunicationMode commMode = DUOXCommunicationMode::Full) override;
 
-    void authenticateEV2NonFirst(uint8_t keyno, std::shared_ptr<DESFireKey> currentKey) override;
+    void authenticateEV2NonFirst(uint8_t keyno, std::shared_ptr<DESFireKey> currentKey = nullptr) override;
 
     std::uint32_t freeMem() override;
 
-    DUOXKeySettings getKeySettings() override;
-    DUOXKeySettings getKeySettings(std::uint8_t option) override;
+    DUOXKeySettings getKeySettings(DUOXKeySettingsOption option = DUOXKeySettingsOption::KeySettings) override;
+
+    void changeKey(std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey) override;
+    void changeKeyEV2(std::uint8_t keySetNo, std::uint8_t keyNo, std::shared_ptr<DESFireKey> newKey) override;
 
     /*
      * DESFire EV2 command interface.
@@ -82,8 +120,8 @@ class LLA_READERS_ISO7816_API DUOXISO7816Commands : public DESFireEV3ISO7816Comm
      * DESFireEV3ISO7816Commands both inherit from the DESFire command hierarchy
      * The ISO/IEC 7816 implementation remains the actual implementation
      */
-    void changeKeyEV2(uint8_t keyset, uint8_t keyno,
-                      std::shared_ptr<DESFireKey> key) override;
+    //void changeKeyEV2(uint8_t keyset, uint8_t keyno,
+    //                  std::shared_ptr<DESFireKey> key) override;
 
     void authenticateEV2First(uint8_t keyno, std::shared_ptr<DESFireKey> key) override;
 
@@ -215,6 +253,50 @@ class LLA_READERS_ISO7816_API DUOXISO7816Commands : public DESFireEV3ISO7816Comm
     protected:
     ISO7816Response transmitDUOX(std::uint8_t cmd, const ByteVector &params, const ByteVector &data,
                  DUOXCommunicationMode commMode = DUOXCommunicationMode::Full);
+
+    private:
+    void changeKeyEV2Internal(std::uint8_t keySetNo, std::uint8_t keyNo,
+        std::shared_ptr<DESFireKey> newKey, DUOXChangeKeyCommand commandType);
+
+
+
+
+    // TODO move these functions into main class definition later (access specifiers redefined temporarily for organization)
+    // And mode ISO functions to ISO class but keep them here for now
+
+    public:
+    void isoGeneralAuthenticate(std::uint8_t caRootKeyNo,
+                                std::uint8_t secondaryCaRootKeyNo, CurveID curve,
+                                bool mutualAuthentication, bool certificatePresent,
+                                std::uint8_t certFileNo, std::uint8_t privateKeyNo,
+                                const ByteVector &privateKey,
+                                const ByteVector &certificate) override;
+
+      void isoGeneralAuthenticatePart1(std::uint8_t caRootKeyNo,
+                                       std::uint8_t secondaryCaRootKeyNo,
+                                       CurveID curve, bool mutualAuthentication,
+                                       bool certificatePresent, std::uint8_t certFileNo,
+                                       std::uint8_t privateKeyNo) override;
+
+      void isoGeneralAuthenticatePart2(const ByteVector &privateKey, const ByteVector &certificate) override;
+
+    private:
+    ISO7816Response sendDUOXGeneralAuthenticate(std::uint8_t p2, const ByteVector &data, std::uint16_t le);
+
+    static std::uint8_t buildDUOXGeneralAuthenticateP2(std::uint8_t caRootKeyNo,
+                                                       std::uint8_t secondaryCaRootKeyNo,
+                                                       bool multipleApplicationSelection);
+
+    static ByteVector buildDUOXOptsA(bool mutualAuthentication, bool certificateAIncluded,
+                                     std::uint8_t certificateFileNo,
+                                     std::uint8_t privateKeyNo);
+
+    static ByteVector buildDUOXAuthenticationData(const ByteVector &ephemeralPublicKey);
+
+    static ECPoint parseDUOXAuthenticationResponse(const ByteVector &response, CurveID curve);
+
+    DUOXECCAuthenticationState d_duoxECCAuthentication;
+
 };
 
 } // namespace logicalaccess

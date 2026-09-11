@@ -10,6 +10,7 @@
 #include <logicalaccess/plugins/crypto/aes_initialization_vector.hpp>
 #include <logicalaccess/plugins/cards/desfire/desfireev2commands.hpp>
 #include <logicalaccess/plugins/readers/iso7816/commands/samav2iso7816commands.hpp>
+#include <logicalaccess/plugins/crypto/secure_memory.hpp>
 
 namespace logicalaccess
 {
@@ -118,14 +119,11 @@ ByteVector DESFireEV2Crypto::getIVEncrypt(bool cmdData)
     auto cipher = std::make_shared<openssl::AESCipher>(
         openssl::OpenSSLSymmetricCipher::ENC_MODE_ECB);
 
-    ByteVector cmdCtrVector, IVdata, IV;
-    const ByteVector labelRespData = {0x5A, 0xA5};
-    const ByteVector labelCmdData  = {0xA5, 0x5A};
+    ByteVector cmdCtrVector, IV;
+    //CmdData or RespData
+    const ByteVector label = cmdData ? ByteVector{0xA5, 0x5A} : ByteVector{0x5A, 0xA5};
 
-    if (cmdData)
-        IVdata = labelCmdData;
-    else
-        IVdata = labelRespData;
+    ByteVector IVdata = label;
 
     IVdata.insert(IVdata.end(), ti_.begin(), ti_.end()); // TI
     BufferHelper::setUInt16(cmdCtrVector, cmdctr_);
@@ -333,6 +331,84 @@ ByteVector DESFireEV2Crypto::changeKey_PICC(unsigned char keyno,
     return cryptogram;
 }
 
+ByteVector DESFireEV2Crypto::buildDUOXChangeKeyData(std::uint8_t keySetNo, std::uint8_t keyNo,
+    const ByteVector &oldKeyDiversify, std::shared_ptr<DESFireKey> newKey, const ByteVector &newKeyDiversify)
+{
+    EXCEPTION_ASSERT_WITH_LOG(newKey != nullptr,
+        LibLogicalAccessException, "DUOX key change requires a valid new key.");
+
+    // DUOX ChangeKey supports AES keys only. AES-128 or AES-256 is determined by the actual key length
+    EXCEPTION_ASSERT_WITH_LOG(newKey->getKeyType() == DESFireKeyType::DF_KEY_AES,
+        LibLogicalAccessException, "DUOX key change supports AES keys only.");
+
+    ByteVector newKeyData;
+    getKey(newKey, newKeyDiversify, newKeyData);
+
+    EXCEPTION_ASSERT_WITH_LOG(newKeyData.size() == 16 || newKeyData.size() == 32,
+        LibLogicalAccessException, "DUOX key change requires a 16-byte or 32-byte AES key.");
+
+    const std::uint8_t targetKeyNo = static_cast<std::uint8_t>(keyNo & 0x3F);
+
+    const bool changingAuthenticatedKey = keySetNo == 0x00 && targetKeyNo == d_currentKeyNo;
+
+    ByteVector keyData;
+
+    if (changingAuthenticatedKey)
+    {
+        keyData.reserve(newKeyData.size() + 1);
+        keyData.insert(keyData.end(), newKeyData.begin(), newKeyData.end());
+        keyData.push_back(newKey->getKeyVersion());
+    }
+    else
+    {
+        ByteVector oldKey;
+        const bool oldKeyAvailable = getKey(keySetNo, targetKeyNo, oldKeyDiversify, oldKey);
+
+        // A disabled/uninitialized target key is represented by an all-zero OldKey
+        // Otherwise, adapt OldKey to the new key size
+        if (!oldKeyAvailable)
+        {
+            oldKey.assign(newKeyData.size(), 0x00);
+        }
+        else
+        {
+            oldKey.resize(newKeyData.size(), 0x00);
+        }
+
+        ByteVector xorKey(newKeyData.size(), 0x00);
+
+        for (std::size_t i = 0; i < newKeyData.size(); ++i)
+            xorKey[i] = static_cast<std::uint8_t>(newKeyData[i] ^ oldKey[i]);
+
+        keyData.reserve(newKeyData.size() + 1 + 4);
+        keyData.insert(keyData.end(), xorKey.begin(), xorKey.end());
+        keyData.push_back(newKey->getKeyVersion());
+
+        // CRC32 is calculated over NewKey, not over XOR(NewKey, OldKey) or KeyVer
+        // The CRC is appended least-significant byte first
+        const std::uint32_t crc = desfire_crc32(newKeyData.data(), newKeyData.size());
+
+        // CRC32 byte order used by the DESFire implementation : LSB first
+        keyData.push_back(static_cast<std::uint8_t>(crc & 0xFF));
+        keyData.push_back(static_cast<std::uint8_t>((crc >> 8) & 0xFF));
+        keyData.push_back(static_cast<std::uint8_t>((crc >> 16) & 0xFF));
+        keyData.push_back(static_cast<std::uint8_t>((crc >> 24) & 0xFF));
+    }
+
+    /*
+     * Expected DUOX KeyData lengths :
+     *
+     *   AES-128 / authenticated key = 17
+     *   AES-128 / other key         = 21
+     *   AES-256 / authenticated key = 33
+     *   AES-256 / other key         = 37
+     */
+    EXCEPTION_ASSERT_WITH_LOG(keyData.size() == 17 || keyData.size() == 21 || keyData.size() == 33 || keyData.size() == 37,
+        LibLogicalAccessException, "DUOX key change generated an invalid KeyData length.");
+
+    return keyData;
+}
+
 void DESFireEV2Crypto::duplicateCurrentKeySet(uint8_t keySetNb)
 {
     duplicateKeySet(0, keySetNb);
@@ -368,4 +444,45 @@ void DESFireEV2Crypto::duplicateKeySet(uint8_t keySetNbToDuplicate, uint8_t keyS
             d_keys[std::make_tuple(d_currentAid, keySetNb, x)] = std::make_shared<DESFireKey>(*d_keys[oIndex]);
     }
 }
+
+void DESFireEV2Crypto::invalidateAuthentication()
+{
+    // Wipe authentication and session-sensitive material before releasing it
+    auto secureClear = [](ByteVector &v)
+    {
+        logicalaccess::security::secureZeroBuffer(v);
+        v.clear();
+    };
+
+    // Session keys and authentication key
+    secureClear(d_sessionKey);
+    secureClear(d_macSessionKey);
+    secureClear(d_authkey);
+
+    // Authentication nonces
+    secureClear(d_rndA);
+    secureClear(d_rndB);
+
+    // EV2 transaction state
+    secureClear(ti_);
+    cmdctr_ = 0;
+
+    // Secure-messaging and chaining state
+    secureClear(d_lastIV);
+    secureClear(d_last_left);
+
+    // Pending protocol data
+    secureClear(d_buf);
+
+    // No authenticated cipher remains.
+    d_cipher.reset();
+
+    // Return to the unauthenticated/default protocol state
+    d_auth_method  = CM_LEGACY;
+    d_currentKeyNo = 0;
+    d_mac_size     = 4;
+
+    // Keep d_currentAid and d_keys intact because it's selection state, not authentication state
+}
+
 } // namespace logicalaccess
